@@ -4,16 +4,23 @@ on:
     push:
         branches: [src]
     workflow_dispatch:
+        inputs:
+            full_rebuild:
+                description: re-minify every aCSS file (ignore manifest)
+                type: boolean
+                default: false
 
 permissions:
     contents: write
 
 concurrency:
     group: minify-css
-    cancel-in-progress: true
+    cancel-in-progress: false
 
 env:
     TARGET_BRANCH: bundle
+    CLEAN_CSS_OPTS: "-O2 --inline none --skip-rebase"
+    MANIFEST: .minify-manifest.json
 
 jobs:
     minify-and-publish:
@@ -23,6 +30,7 @@ jobs:
               uses: actions/checkout@v7
               with:
                   ref: src
+                  path: source
 
             - name: setup node
               uses: actions/setup-node@v7
@@ -32,27 +40,95 @@ jobs:
             - name: install clean-css-cli
               run: npm install -g clean-css-cli
 
-            - name: minify all CSS files
+            - name: minify changed css and publish
+              env:
+                  FULL_REBUILD: ${{ inputs.full_rebuild }}
               run: |
-                  find . -type f -name "*.css" \
-                    ! -name "*.min.css" \
-                    -not -path "./.git/*" \
-                    -not -path "./node_modules/*" \
-                    -print0 |
-                  while IFS= read -r -d '' file; do
-                    echo "minifying $file"
-                    cleancss -O2 "$file" -o "$file.tmp"
-                    mv "$file.tmp" "$file"
-                  done
+                  set -euo pipefail
 
-            - name: publish ${{ env.TARGET_BRANCH }}
-              run: |
+                  SRC="$GITHUB_WORKSPACE/source"
+                  OUT="$GITHUB_WORKSPACE/out"
+                  TOOLCHAIN="clean-css $(cleancss --version) $CLEAN_CSS_OPTS"
+
+                  cd "$SRC"
                   git config user.name "github-actions[bot]"
                   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-                  rm -rf .github
+                  if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null 2>&1; then
+                    git fetch --depth=1 origin "$TARGET_BRANCH"
+                    git worktree add -B "$TARGET_BRANCH" "$OUT" FETCH_HEAD
+                  else
+                    echo "branch $TARGET_BRANCH doesn't exist yet, creating it"
+                    git worktree add --detach "$OUT"
+                    git -C "$OUT" checkout --orphan "$TARGET_BRANCH"
+                    git -C "$OUT" rm -rf --quiet .
+                  fi
 
-                  git checkout --orphan build
+                  OLD=/tmp/old-manifest.json
+                  echo '{"toolchain":"","files":{}}' > "$OLD"
+                  if [ -f "$OUT/$MANIFEST" ] && [ "$FULL_REBUILD" != "true" ] \
+                     && [ "$(jq -r .toolchain "$OUT/$MANIFEST" 2>/dev/null || true)" = "$TOOLCHAIN" ]; then
+                    cp "$OUT/$MANIFEST" "$OLD"
+                  else
+                    echo "no usable manifest, rebuilding every CSS file"
+                  fi
+
+                  declare -A old_hash=()
+                  while IFS=$'\t' read -r k v; do
+                    old_hash["$k"]="$v"
+                  done < <(jq -r '.files | to_entries[] | [.key, .value] | @tsv' "$OLD")
+
+                  rsync -a --delete \
+                    --exclude='/.git' --exclude='/.github' --exclude='node_modules' \
+                    --exclude="/$MANIFEST" \
+                    --include='*.min.css' --exclude='*.css' \
+                    "$SRC/" "$OUT/"
+
+                  : > /tmp/new-manifest.tsv
+                  minified=0; skipped=0; removed=0
+                  while IFS= read -r -d '' f; do
+                    rel="${f#./}"
+                    hash="$(sha256sum "$f" | cut -d' ' -f1)"
+                    printf '%s\t%s\n' "$rel" "$hash" >> /tmp/new-manifest.tsv
+
+                    if [ "${old_hash[$rel]:-}" = "$hash" ] && [ -f "$OUT/$rel" ]; then
+                      skipped=$((skipped + 1))
+                      continue
+                    fi
+
+                    echo "minifying $rel"
+                    mkdir -p "$OUT/$(dirname "$rel")"
+                    if ! cleancss $CLEAN_CSS_OPTS "$f" -o "$OUT/$rel"; then
+                      echo "::error file=$rel::clean-css failed, nothing was published"
+                      exit 1
+                    fi
+                    minified=$((minified + 1))
+                  done < <(find . -type f -name '*.css' ! -name '*.min.css' \
+                             -not -path './.git/*' -not -path './.github/*' \
+                             -not -path '*/node_modules/*' -print0)
+
+                  while IFS= read -r -d '' f; do
+                    rel="${f#./}"
+                    if [ ! -f "$SRC/$rel" ]; then
+                      echo "removing $rel"
+                      rm "$OUT/$rel"
+                      removed=$((removed + 1))
+                    fi
+                  done < <(cd "$OUT" && find . -type f -name '*.css' ! -name '*.min.css' \
+                             -not -path './.git/*' -print0)
+
+                  LC_ALL=C sort /tmp/new-manifest.tsv | jq -Rn -S --arg tc "$TOOLCHAIN" \
+                    '{toolchain: $tc, files: ([inputs | split("\t") | {key: .[0], value: .[1]}] | from_entries)}' \
+                    > "$OUT/$MANIFEST"
+
+                  cd "$OUT"
                   git add -A
-                  git commit -m "minified aCSS, ${GITHUB_SHA::7}"
-                  git push --force origin build:"$TARGET_BRANCH"
+                  if git diff --cached --quiet; then
+                    echo "nothing changed, no commit"
+                    echo "### aCSS: nothing to publish ($skipped files already up to date)" >> "$GITHUB_STEP_SUMMARY"
+                    exit 0
+                  fi
+
+                  git commit -q -m "minify acss: $minified rebuilt, $skipped unchanged, $removed removed (src@${GITHUB_SHA::7})"
+                  git -C "$SRC" push origin "$TARGET_BRANCH"
+                  echo "### aCSS: $minified rebuilt, $skipped unchanged, $removed removed" >> "$GITHUB_STEP_SUMMARY"
