@@ -13,7 +13,7 @@ concurrency:
     cancel-in-progress: true
 
 env:
-    TARGET_BRANCH: dist
+    TARGET_BRANCH: bundle
 
 jobs:
     minify-and-publish:
@@ -52,7 +52,7 @@ jobs:
 
                   rm -rf .github
 
-                  git checkout --orphan bundle
+                  git checkout --orphan build
                   git add -A
                   git commit -m "minified aCSS, ${GITHUB_SHA::7}"
-                  git push --force origin bundle:"$TARGET_BRANCH"
+                  git push --force origin build:"$TARGET_BRANCH"
