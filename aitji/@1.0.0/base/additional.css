@@ -1,0 +1,14 @@
+#particles {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: var(--z-particle);
+}
+
+.particle {
+    position: fixed;
+    pointer-events: none;
+    z-index: var(--z-particle);
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+}

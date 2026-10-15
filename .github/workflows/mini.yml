@@ -1,0 +1,58 @@
+name: mini
+
+on:
+    push:
+        branches: [src]
+    workflow_dispatch:
+
+permissions:
+    contents: write
+
+concurrency:
+    group: minify-css
+    cancel-in-progress: true
+
+env:
+    TARGET_BRANCH: dist
+
+jobs:
+    minify-and-publish:
+        runs-on: ubuntu-latest
+        steps:
+            - name: checkout src
+              uses: actions/checkout@v7
+              with:
+                  ref: src
+
+            - name: setup node
+              uses: actions/setup-node@v7
+              with:
+                  node-version: 20
+
+            - name: install clean-css-cli
+              run: npm install -g clean-css-cli
+
+            - name: minify all CSS files
+              run: |
+                  find . -type f -name "*.css" \
+                    ! -name "*.min.css" \
+                    -not -path "./.git/*" \
+                    -not -path "./node_modules/*" \
+                    -print0 |
+                  while IFS= read -r -d '' file; do
+                    echo "minifying $file"
+                    cleancss -O2 "$file" -o "$file.tmp"
+                    mv "$file.tmp" "$file"
+                  done
+
+            - name: publish ${{ env.TARGET_BRANCH }}
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+                  rm -rf .github
+
+                  git checkout --orphan bundle
+                  git add -A
+                  git commit -m "minified aCSS, ${GITHUB_SHA::7}"
+                  git push --force origin bundle:"$TARGET_BRANCH"
